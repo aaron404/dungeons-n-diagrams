@@ -1,10 +1,12 @@
 #![feature(array_chunks)]
 #![feature(array_windows)]
+#![feature(stmt_expr_attributes)]
+use std::{collections::HashSet, fmt::Display, io::empty, thread, time::Duration};
 
-use std::collections::HashSet;
-
+use enigo::{Enigo, MouseButton::*, MouseControllable};
 use image::{DynamicImage, GenericImageView, RgbaImage};
 use win_screenshot::prelude::*;
+use windows_sys::Win32::Foundation::ERROR_VID_INVALID_NUMA_NODE_INDEX;
 
 // Size of tile to consider for number parsing
 pub const TILE_SIZE: usize = 33;
@@ -40,6 +42,21 @@ pub const _NUM_SIZE: (usize, usize) = (19, 18);
 // Top-left pixel of the game board
 pub const BOARD_BASE: (usize, usize) = (44, 174);
 
+pub const SEED_BASE: (usize, usize) = (102, 103);
+const SAMPLE_POINT_SEED: (usize, usize) = (100, 99);
+
+const MENU_OFFSET: (i32, i32) = (70, 33);
+const RESET_OFFSET: (i32, i32) = (50, 95);
+
+const IDS: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+
+const EASY_SEEDS: &[u32] = &[23452480, 57689545, 22995315, 63686131, 27417709, 51098501];
+const MED_SEEDS: [u32; 2] = [21380804, 20926259];
+
+const CLICK_DELAY: u64 = 5;
+
+const NEIGHBORS: [(i8, i8); 4] = [(-1, 0), (0, -1), (1, 0), (0, 1)];
+
 #[derive(Debug)]
 enum PatternSearchError {
     NotFound,
@@ -67,6 +84,214 @@ pub enum TileContents {
     Golem,
     Insect,
     Minotaur,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub enum BoardState {
+    Empty,
+    Enemy,
+    Treasure,
+    Wall,
+    Path,
+}
+
+pub enum Placeable {
+    Wall,
+    Path,
+}
+
+impl Display for BoardState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BoardState::Empty => write!(f, " _"),
+            BoardState::Enemy => write!(f, " E"),
+            BoardState::Treasure => write!(f, " T"),
+            BoardState::Wall => write!(f, " W"),
+            BoardState::Path => write!(f, " P"),
+        }
+    }
+}
+
+pub struct Puzzle {
+    window_pos: (i32, i32),
+    game_pos: (usize, usize),
+    enigo: Enigo,
+    top_nums: [u8; 8],
+    left_nums: [u8; 8],
+    board: [[BoardState; 8]; 8],
+}
+
+impl Display for Puzzle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "top nums: {:?}", self.top_nums)?;
+        writeln!(f, "left nums:{:?}", self.left_nums)?;
+        for row in self.board {
+            for col in row {
+                write!(f, "{col}")?;
+            }
+            writeln!(f)?;
+        }
+        Ok(())
+    }
+}
+
+impl Puzzle {
+    pub fn solve(&mut self) {
+        // let mut moves = vec![];
+        self.reset_solution();
+
+        let mut state_changed = true;
+        while state_changed {
+            state_changed = self.solve_trivial();
+            println!("{self}");
+            state_changed |= self.check_enemies();
+            println!("{self}");
+        }
+    }
+
+    fn solve_trivial(&mut self) -> bool {
+        use BoardState::*;
+
+        let mut state_changed = false;
+
+        // check rows
+        for row in 0..8 {
+            let row = row as usize;
+            let empty_count = self.board[row].iter().filter(|&&s| s == Empty).count();
+            let wall_count = self.board[row].iter().filter(|&&s| s == Wall).count();
+            let walls_needed = self.left_nums[row] as usize - wall_count;
+
+            if walls_needed == 0 {
+                for i in 0..8 {
+                    if self.board[row][i] == Empty {
+                        self.board[row][i] = Path;
+                        self.place_entity(i, row, Placeable::Path);
+                    }
+                }
+            } else if walls_needed == empty_count {
+                for i in 0..8 {
+                    if self.board[row][i] == Empty {
+                        self.board[row][i] = Wall;
+                        self.place_entity(i, row, Placeable::Wall);
+                    }
+                }
+            }
+        }
+
+        // check cols
+        for col in 0..8 {
+            let col = col as usize;
+            let empty_count = self.board.iter().filter(|&&s| s[col] == Empty).count();
+            let wall_count = self.board.iter().filter(|&&s| s[col] == Wall).count();
+            let walls_needed = self.top_nums[col] as usize - wall_count;
+
+            if walls_needed == 0 {
+                for i in 0..8 {
+                    if self.board[i][col] == Empty {
+                        self.board[i][col] = Path;
+                        state_changed = true;
+                        self.place_entity(col, i, Placeable::Path);
+                    }
+                }
+            } else if walls_needed == empty_count {
+                for i in 0..8 {
+                    if self.board[i][col] == Empty {
+                        self.board[i][col] = Wall;
+                        state_changed = true;
+                        self.place_entity(col, i, Placeable::Wall);
+                    }
+                }
+            }
+        }
+        state_changed
+    }
+
+    fn check_enemies(&mut self) -> bool {
+        use BoardState::*;
+
+        let mut state_changed = false;
+
+        for row in 0..8u8 {
+            for col in 0..8u8 {
+                if self.board[row as usize][col as usize] == Enemy {
+                    let mut valid_neighbors = 0;
+                    let mut path_count = 0;
+                    let mut empty_count = 0;
+                    let mut empty_cells = vec![];
+                    for offset in NEIGHBORS {
+                        let x = col.wrapping_add_signed(offset.0);
+                        let y = row.wrapping_add_signed(offset.1);
+                        if x < 8 && y < 8 {
+                            valid_neighbors += 1;
+                            match self.board[y as usize][x as usize] {
+                                Empty => {
+                                    empty_count += 1;
+                                    empty_cells.push((x, y));
+                                }
+                                Enemy => panic!("Cannot have two enemies next to each other"),
+                                Treasure => panic!("Cannot have enemy next to a chest"),
+                                Wall => (),
+                                Path => path_count += 1,
+                            }
+                        }
+                    }
+                    match path_count {
+                        0 => match empty_count {
+                            0 => panic!("No room for path"),
+                            1 => {
+                                let (x, y) = empty_cells[0];
+                                self.board[y as usize][x as usize] = Path;
+                                state_changed = true;
+                                self.place_entity(x as usize, y as usize, Placeable::Path);
+                            }
+                            _ => (),
+                        },
+                        1 => match empty_count {
+                            0 => (),
+                            _ => {
+                                for (x, y) in empty_cells.iter() {
+                                    self.board[*y as usize][*x as usize] = Wall;
+                                    state_changed = true;
+                                    self.place_entity(*x as usize, *y as usize, Placeable::Wall);
+                                }
+                            }
+                        },
+                        _ => panic!("Enemy can only have one path"),
+                    }
+                }
+            }
+        }
+        state_changed
+    }
+
+    fn place_entity(&mut self, x: usize, y: usize, entity: Placeable) {
+        let x = self.window_pos.0
+            + (self.game_pos.0 + BOARD_BASE.0 + x * TILE_SIZE + TILE_SIZE / 2) as i32;
+        let y = self.window_pos.1
+            + (self.game_pos.1 + BOARD_BASE.1 + y * TILE_SIZE + TILE_SIZE / 2) as i32;
+
+        let button = match entity {
+            Placeable::Wall => Left,
+            Placeable::Path => Right,
+        };
+        self.click(x, y, button);
+    }
+
+    fn reset_solution(&mut self) {
+        let x = self.window_pos.0 + self.game_pos.0 as i32;
+        let y = self.window_pos.1 + self.game_pos.1 as i32;
+        self.click(x + 10, y + 10, Left);
+        self.click(x + MENU_OFFSET.0, y + MENU_OFFSET.1, Left);
+        thread::sleep(Duration::from_millis(500));
+        self.click(x + RESET_OFFSET.0, y + RESET_OFFSET.1, Left);
+    }
+
+    fn click(&mut self, x: i32, y: i32, button: enigo::MouseButton) {
+        self.enigo.mouse_move_to(x, y);
+        thread::sleep(Duration::from_millis(CLICK_DELAY));
+        self.enigo.mouse_click(button);
+        thread::sleep(Duration::from_millis(CLICK_DELAY));
+    }
 }
 
 fn find_dnd_window(buffer: &RgbBuf) -> Result<(usize, usize), PatternSearchError> {
@@ -164,57 +389,114 @@ fn parse_digit(buffer: &RgbBuf) -> u8 {
     }
 }
 
-pub fn parse_board(buffer: &RgbBuf) {
+pub fn parse_board(buffer: &RgbBuf, window_pos: (i32, i32)) -> Puzzle {
     // get offset
-    let (window_x, window_y) = find_dnd_window(buffer).expect("Failed to find DND window");
+    let game_pos = find_dnd_window(buffer).expect("Failed to find DND window");
 
     // read top numbers
-    print!("top numbers:  ");
-    for i in 0..8 {
-        let x = window_x + TOP_NUMS_BASE.0 + TOP_NUMS_OFFSETS[i] + TILE_SIZE * i;
-        let y = window_y + TOP_NUMS_BASE.1;
+    let top_nums = IDS.map(|i| {
+        let x =
+            game_pos.0 + TOP_NUMS_BASE.0 + TOP_NUMS_OFFSETS[i as usize] + TILE_SIZE * i as usize;
+        let y = game_pos.1 + TOP_NUMS_BASE.1;
         let tile = sub_buffer(buffer, x, y, TILE_SIZE, TILE_SIZE);
-        save_buffer(&tile, format!("nums/top_{i}.png"));
-        print!("{} ", parse_digit(&tile));
-    }
-    println!();
+        parse_digit(&tile)
+    });
 
-    print!("left numbers: ");
-    for i in 0..8 {
-        let x = window_x + LEFT_NUMS_BASE.0;
-        let y = window_y + LEFT_NUMS_BASE.1 + LEFT_NUMS_OFFSETS[i] + TILE_SIZE * i;
+    let left_nums = IDS.map(|i| {
+        let x = game_pos.0 + LEFT_NUMS_BASE.0;
+        let y =
+            game_pos.1 + LEFT_NUMS_BASE.1 + LEFT_NUMS_OFFSETS[i as usize] + TILE_SIZE * i as usize;
         let tile = sub_buffer(buffer, x, y, TILE_SIZE, TILE_SIZE);
-        save_buffer(&tile, format!("nums/left_{i}.png"));
-        print!("{} ", parse_digit(&tile));
-    }
-    println!();
+        parse_digit(&tile)
+    });
 
-    println!("Board state:");
-    for j in 0..8 {
-        for i in 0..8 {
-            // let buf = sub_buffer(
-            //     buffer,
-            //     window_x + BOARD_BASE.0 + i * TILE_SIZE,
-            //     window_y + BOARD_BASE.1 + j * TILE_SIZE,
-            //     TILE_SIZE,
-            //     TILE_SIZE,
-            // );
-            // save_buffer(&buf, format!("tiles/{i}-{j}.png"));
-            let x = window_x + BOARD_BASE.0 + SAMPLE_POINT_ENEMY.0 + i * TILE_SIZE;
-            let y = window_y + BOARD_BASE.1 + SAMPLE_POINT_ENEMY.1 + j * TILE_SIZE;
+    let board = IDS.map(|row| {
+        IDS.map(|col| {
+            let x = game_pos.0 + BOARD_BASE.0 + SAMPLE_POINT_ENEMY.0 + col as usize * TILE_SIZE;
+            let y = game_pos.1 + BOARD_BASE.1 + SAMPLE_POINT_ENEMY.1 + row as usize * TILE_SIZE;
             let id = (y * buffer.width as usize + x) * 4;
             let green = buffer.pixels[id + 1];
             if [77, 80, 128].contains(&green) {
-                print!("_");
+                BoardState::Empty
+            } else if green == 120 {
+                BoardState::Treasure
             } else {
-                if green == 120 {
-                    print!("T");
-                } else {
-                    print!("E");
-                }
+                BoardState::Enemy
             }
+        })
+    });
+
+    // check if we are in seeded
+    let seeded = {
+        let x = game_pos.0 + SAMPLE_POINT_SEED.0;
+        let y = game_pos.1 + SAMPLE_POINT_SEED.1;
+        let id = (y * buffer.width as usize + x) * 4;
+        let red = buffer.pixels[id];
+        red == 83
+    };
+
+    println!("Board is seeded");
+    let seed = {
+        let mut seed = 0;
+        let bx = game_pos.0 + SEED_BASE.0;
+        let by = game_pos.1 + SEED_BASE.1;
+        let mut x = 0;
+        while x < 70 {
+            let cx = bx + x;
+            let id = (by * buffer.width as usize + cx) * 4;
+            let red = buffer.pixels[id];
+            if red == 52 {
+                let mut count = 0;
+                loop {
+                    let id = (by * buffer.width as usize + cx + count) * 4;
+                    if buffer.pixels[id] == 52 {
+                        count += 1;
+                    } else {
+                        break;
+                    }
+                }
+                x += count;
+                seed = seed * 10
+                    + {
+                        match count {
+                            3 => {
+                                #[rustfmt::skip]
+                                if buffer.pixels[((by + 1) * buffer.width as usize + cx + 1) * 4] == 52 {
+                                    if buffer.pixels[((by + 1) * buffer.width as usize + cx) * 4] == 52 {1} else {4}
+                                } else if buffer.pixels[((by + 3) * buffer.width as usize + cx + 1) * 4] == 52 {0} else {2}
+                            } // 0 1 2 4
+                            5 => {
+                                #[rustfmt::skip]
+                                if buffer.pixels[((by + 1) * buffer.width as usize + cx) * 4] == 52 {
+                                    if buffer.pixels[((by + 1) * buffer.width as usize + cx + 4) * 4] == 52 {9} else {6}
+                                } else {8}
+                            } // 6 8 9
+                            6 => {
+                                #[rustfmt::skip]
+                                if buffer.pixels[((by + 1) * buffer.width as usize + cx + 5) * 4] == 52 {7} else {3}
+                            } // 3 7
+                            7 => 5,
+                            n => panic!("Unable to parse digit: {n}"),
+                        }
+                    }
+            }
+            // print!("{}", if red == 52 { "X" } else { " " });
+            x += 1;
         }
-        println!()
+        seed
+    };
+    println!();
+    println!("Seed: {seed:08}");
+
+    let enigo = Enigo::new();
+    // enigo.mouse_move_to(window_info.rcClient.left, window_info.rcClient.top);
+    Puzzle {
+        window_pos,
+        game_pos,
+        enigo,
+        top_nums,
+        left_nums,
+        board,
     }
 }
 

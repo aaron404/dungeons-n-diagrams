@@ -1,7 +1,7 @@
 #![feature(array_windows)]
 #![feature(slice_flatten)]
 #![feature(array_chunks)]
-
+#![feature(stmt_expr_attributes)]
 use std::{
     thread,
     time::{Duration, Instant},
@@ -10,6 +10,7 @@ use std::{
 use win_screenshot::prelude::*;
 
 use dungeons_n_diagrams::*;
+mod tex;
 
 use enigo::*;
 
@@ -25,16 +26,9 @@ fn print_rect(rect: RECT) {
         rect.bottom - rect.top
     );
 }
-fn main() {
+
+fn get_window_info() {
     let hwnd = find_window(WINDOW_NAME).expect("Couldn't find window");
-
-    let mut rect = RECT {
-        left: 0,
-        top: 0,
-        right: 0,
-        bottom: 0,
-    };
-
     let mut window_info = WINDOWINFO {
         cbSize: 0,
         rcWindow: RECT {
@@ -58,36 +52,24 @@ fn main() {
         wCreatorVersion: 0,
     };
 
-    // unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect) };
     unsafe { GetWindowInfo(hwnd, &mut window_info) };
-    print_rect(window_info.rcWindow);
-    print_rect(window_info.rcClient);
 
-    let t0 = Instant::now();
+    let window_pos = (window_info.rcClient.left, window_info.rcClient.top);
 
-    let mut enigo = Enigo::new();
-    enigo.mouse_move_to(window_info.rcClient.left, window_info.rcClient.top);
+    let buf = capture_window_ex(hwnd, Using::BitBlt, Area::ClientOnly, None, None)
+        .expect("Couldn't capture window");
 
-    // let buf = RgbBuf {
-    //     pixels: image::open("screenshot_annotated.png")
-    //         .unwrap()
-    //         .into_bytes(),
-    //     width: 960,
-    //     height: 540,
+    let mut puzzle = parse_board(&buf, window_pos);
+    puzzle.solve();
+}
+fn main() {
+    // tex::list_monsters();
+    // std::process::exit(0);
 
-    let mut s = String::new();
-    loop {
-        let buf = capture_window_ex(hwnd, Using::BitBlt, Area::ClientOnly, None, None)
-            .expect("Couldn't capture window");
-        parse_board(&buf);
-
-        std::io::stdin().read_line(&mut s).unwrap();
-    }
+    get_window_info();
 
     // find_sprite_discriminator();
     // get_sprite_samples();
-
-    println!("total time: {:?}", Instant::now() - t0);
 
     //     thread::sleep(Duration::from_millis(200));
     // }
