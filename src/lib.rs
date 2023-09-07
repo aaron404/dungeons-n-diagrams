@@ -3,10 +3,12 @@
 #![feature(stmt_expr_attributes)]
 use std::{collections::HashSet, fmt::Display, io::empty, thread, time::Duration};
 
-use enigo::{Enigo, MouseButton::*, MouseControllable};
+use enigo::{Enigo, KeyboardControllable, MouseButton::*, MouseControllable};
 use image::{DynamicImage, GenericImageView, RgbaImage};
 use win_screenshot::prelude::*;
-use windows_sys::Win32::Foundation::ERROR_VID_INVALID_NUMA_NODE_INDEX;
+
+use windows_sys::Win32::Foundation::RECT;
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowInfo, WINDOWINFO};
 
 // Size of tile to consider for number parsing
 pub const TILE_SIZE: usize = 33;
@@ -47,9 +49,12 @@ const SAMPLE_POINT_SEED: (usize, usize) = (100, 99);
 
 const MENU_OFFSET: (i32, i32) = (70, 33);
 const RESET_OFFSET: (i32, i32) = (50, 95);
+const RANDOM_OFFSET: (i32, i32) = (283, 107);
+const CHOOSE_OFFSET: (i32, i32) = (216, 107);
 
 const IDS: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
 
+const SEED_MAX: u32 = 99999999;
 const EASY_SEEDS: &[u32] = &[23452480, 57689545, 22995315, 63686131, 27417709, 51098501];
 const MED_SEEDS: [u32; 2] = [21380804, 20926259];
 
@@ -60,9 +65,19 @@ const NEIGHBORS: [(i8, i8); 4] = [(-1, 0), (0, -1), (1, 0), (0, 1)];
 #[derive(Debug)]
 enum PatternSearchError {
     NotFound,
-    NonUnique(usize),
+    MultipleResults(usize),
     OutOfBounds,
 }
+
+#[derive(Debug)]
+pub enum InitializationError {
+    WindowNotFound,
+    WindowCaptureError,
+    GameNotFound,
+    MultipleResults(usize),
+    OutOfBounds,
+}
+
 #[derive(Debug)]
 pub enum TileContents {
     Empty,
@@ -112,6 +127,174 @@ impl Display for BoardState {
     }
 }
 
+enum Seed {
+    Seeded(u32),
+    Random,
+}
+
+#[derive(Debug)]
+pub struct DungeonCrawler {
+    window_pos: (i32, i32),
+    game_pos: (usize, usize),
+    hwnd: isize,
+    enigo: Enigo,
+}
+
+impl DungeonCrawler {
+    pub fn new() -> Result<Self, InitializationError> {
+        let hwnd = match find_window(WINDOW_NAME) {
+            Ok(hwnd) => hwnd,
+            Err(_) => return Err(InitializationError::WindowNotFound),
+        };
+
+        let mut window_info = WINDOWINFO {
+            cbSize: 0,
+            rcWindow: RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
+            rcClient: RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
+            dwStyle: 0,
+            dwExStyle: 0,
+            dwWindowStatus: 0,
+            cxWindowBorders: 0,
+            cyWindowBorders: 0,
+            atomWindowType: 0,
+            wCreatorVersion: 0,
+        };
+
+        unsafe { GetWindowInfo(hwnd, &mut window_info) };
+
+        let window_pos = (window_info.rcClient.left, window_info.rcClient.top);
+
+        let buffer = match capture_window_ex(hwnd, Using::BitBlt, Area::ClientOnly, None, None) {
+            Ok(buf) => buf,
+            Err(_) => return Err(InitializationError::WindowCaptureError),
+        };
+
+        let game_pos = match find_dnd_window(&buffer) {
+            Ok(pos) => pos,
+            Err(e) => match e {
+                PatternSearchError::NotFound => return Err(InitializationError::GameNotFound),
+                PatternSearchError::MultipleResults(n) => {
+                    return Err(InitializationError::MultipleResults(n))
+                }
+                PatternSearchError::OutOfBounds => return Err(InitializationError::OutOfBounds),
+            },
+        };
+
+        let mut enigo = Enigo::new();
+        enigo.mouse_move_to(window_pos.0 + 10, window_pos.1 + 10);
+        enigo.mouse_click(Left);
+        thread::sleep(Duration::from_micros(200));
+
+        // let mut puzzle = parse_board(&buf, window_pos);
+        // puzzle.solve();
+        Ok(Self {
+            window_pos,
+            game_pos,
+            hwnd,
+            enigo,
+        })
+    }
+
+    fn new_puzzle(&mut self, seed: Seed) {
+        use winput::Vk;
+
+        match seed {
+            Seed::Seeded(seed) => {
+                if seed > SEED_MAX {
+                    panic!("Seed must be less than {SEED_MAX}")
+                } else {
+                    self.click(CHOOSE_OFFSET.0, CHOOSE_OFFSET.1, Left);
+                    thread::sleep(Duration::from_millis(1000));
+                    for i in 0..8 {
+                        winput::send(Vk::Backspace);
+                        //     self.enigo.key_click(enigo::Key::Raw(i));
+                        thread::sleep(Duration::from_millis(200));
+                        winput::send(Vk::_5);
+                        thread::sleep(Duration::from_millis(200));
+                    }
+                    winput::send_str("\x10\n");
+                    thread::sleep(Duration::from_millis(123123));
+
+                    winput::send_str("0123456789");
+                    winput::send(Vk::Backspace);
+                    winput::send(Vk::Enter);
+
+                    thread::sleep(Duration::from_millis(200));
+                    let s = format!("\x08\x08\x08\x08{seed}\r\n");
+                    println!("  sequence: {s}");
+                    // self.enigo.key_sequence(s.as_str());
+                    // self.enigo.key_sequence("\na\x08");
+                    // thread::sleep(Duration::from_millis(200));
+                    // self.enigo.key_click(enigo::Key::Raw(13));
+                    // thread::sleep(Duration::from_millis(200));
+                }
+            }
+            Seed::Random => self.click(RANDOM_OFFSET.0, RANDOM_OFFSET.1, Left),
+        }
+    }
+
+    pub fn solve_loop(&mut self) {
+        loop {
+            self.new_puzzle(Seed::Random);
+            thread::sleep(Duration::from_millis(250));
+            self.solve();
+
+            thread::sleep(Duration::from_millis(1000));
+        }
+    }
+
+    fn solve(&mut self) {
+        let buffer =
+            capture_window_ex(self.hwnd, Using::BitBlt, Area::ClientOnly, None, None).unwrap();
+
+        let mut puzzle = parse_board(&buffer, self.window_pos);
+        puzzle.solve();
+    }
+
+    pub fn test_seeds(&mut self) {
+        use winput::Vk;
+        // for i in 0..8 {
+        //     self.new_puzzle(Seed::Random);
+        //     thread::sleep(Duration::from_millis(250));
+        // }
+
+        // for seed in EASY_SEEDS {
+        //     println!("Trying seed: {seed}");
+        //     self.new_puzzle(Seed::Seeded(*seed));
+        //     break;
+        // }
+
+        thread::sleep(Duration::from_millis(1000));
+        winput::send_str("aababc08");
+        thread::sleep(Duration::from_millis(500));
+        winput::send(Vk::Backspace);
+        thread::sleep(Duration::from_millis(500));
+        winput::send(Vk::Backspace);
+        thread::sleep(Duration::from_millis(500));
+        winput::send(Vk::Enter);
+    }
+
+    fn click(&mut self, x: i32, y: i32, button: enigo::MouseButton) {
+        self.enigo.mouse_move_to(
+            self.window_pos.0 + self.game_pos.0 as i32 + x,
+            self.window_pos.1 + self.game_pos.1 as i32 + y,
+        );
+        thread::sleep(Duration::from_millis(CLICK_DELAY));
+        self.enigo.mouse_click(button);
+        thread::sleep(Duration::from_millis(CLICK_DELAY));
+    }
+}
+
 pub struct Puzzle {
     window_pos: (i32, i32),
     game_pos: (usize, usize),
@@ -137,15 +320,14 @@ impl Display for Puzzle {
 
 impl Puzzle {
     pub fn solve(&mut self) {
-        // let mut moves = vec![];
-        self.reset_solution();
+        // self.reset_solution();
 
         let mut state_changed = true;
         while state_changed {
             state_changed = self.solve_trivial();
-            println!("{self}");
+            // println!("{self}");
             state_changed |= self.check_enemies();
-            println!("{self}");
+            // println!("{self}");
         }
     }
 
@@ -322,7 +504,7 @@ fn find_dnd_window(buffer: &RgbBuf) -> Result<(usize, usize), PatternSearchError
                 Ok(matches[0])
             }
         }
-        n => Err(NonUnique(n)),
+        n => Err(MultipleResults(n)),
     }
 }
 
@@ -435,7 +617,6 @@ pub fn parse_board(buffer: &RgbBuf, window_pos: (i32, i32)) -> Puzzle {
         red == 83
     };
 
-    println!("Board is seeded");
     let seed = {
         let mut seed = 0;
         let bx = game_pos.0 + SEED_BASE.0;
@@ -485,7 +666,6 @@ pub fn parse_board(buffer: &RgbBuf, window_pos: (i32, i32)) -> Puzzle {
         }
         seed
     };
-    println!();
     println!("Seed: {seed:08}");
 
     let enigo = Enigo::new();
