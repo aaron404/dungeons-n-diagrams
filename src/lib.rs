@@ -60,7 +60,9 @@ const SEED_MAX: u32 = 99999999;
 const EASY_SEEDS: &[u32] = &[23452480, 57689545, 22995315, 63686131, 27417709, 51098501];
 const MED_SEEDS: [u32; 2] = [21380804, 20926259];
 
-const CLICK_DELAY: u64 = 10;
+const AMBIGUOUS_SEEDS: &[u32] = &[25258458];
+
+const CLICK_DELAY: u64 = 15;
 
 const NEIGHBORS: [(i8, i8); 4] = [(-1, 0), (0, -1), (1, 0), (0, 1)];
 
@@ -103,31 +105,10 @@ pub enum TileContents {
     Minotaur,
 }
 
-// #[derive(Copy, Clone, Eq, PartialEq)]
-// pub enum BoardState {
-//     Empty,
-//     Enemy,
-//     Treasure,
-//     Wall,
-//     Path,
-// }
-
 pub enum Placeable {
     Wall,
     Path,
 }
-
-// impl Display for BoardState {
-//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//         match self {
-//             BoardState::Empty => write!(f, " _"),
-//             BoardState::Enemy => write!(f, " E"),
-//             BoardState::Treasure => write!(f, " T"),
-//             BoardState::Wall => write!(f, " W"),
-//             BoardState::Path => write!(f, " P"),
-//         }
-//     }
-// }
 
 enum Seed {
     Seeded(u32),
@@ -245,19 +226,41 @@ impl DungeonCrawler {
         }
     }
 
-    pub fn solve_loop(&mut self) {
-        // 12996803
+    // simply reads seeds and parses boards as fast as possible
+    pub fn read_loop(&mut self) {
         loop {
             let mut puzzle = self.parse_puzzle();
-            let moves = puzzle.solve();
-            println!("{puzzle}");
+            // println!("{puzzle}");
+            puzzle.serialize();
+            self.new_puzzle(Seed::Random);
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
 
-            for (x, y, entity) in moves.into_iter() {
-                self.place_entity(x, y, entity)
+    pub fn solve_loop(&mut self) {
+        // 12996803
+
+        let mut i = 0;
+        loop {
+            let mut puzzle = self.parse_puzzle();
+            println!("{:?}", puzzle.get_seed());
+            let moves = puzzle.solve();
+
+            for (x, y, entity) in moves.iter() {
+                self.place_entity(*x, *y, *entity)
             }
 
-            break;
-            thread::sleep(Duration::from_millis(1000));
+            if moves.len() > 1 {
+                thread::sleep(Duration::from_millis(2000));
+            }
+
+            i += 1;
+            if i == 100 {
+                break;
+            }
+
+            // let mut s = String::new();
+            // std::io::stdin().read_line(&mut s);
 
             self.new_puzzle(Seed::Random);
             thread::sleep(Duration::from_millis(100));
